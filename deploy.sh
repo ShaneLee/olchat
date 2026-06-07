@@ -2,4 +2,4 @@
 
 set -e
 
-cp olchat /usr/local/bin/olchat
+cp olchat /usr/local/bin/
