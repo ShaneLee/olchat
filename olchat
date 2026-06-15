@@ -75,8 +75,8 @@ class Colors:
     def wrap(text: str, color: str) -> str:
         return f"{color}{text}{Colors.RESET}"
 
-MODEL        = "gemma4:e4b"
-OLLAMA_URL   = "http://localhost:11434/api"
+MODEL        = "gemma4:12b"
+OLLAMA_URL   = "http://localhost:11434/v1"
 PERMS_FILE   = Path.home() / ".ollama_chat_perms.json"
 TASKS_DB     = Path.home() / ".ollama_chat_tasks.db"
 SKILLS_DIR   = Path.home() / ".bin/.skills"
@@ -682,10 +682,9 @@ def build_system_prompt(file_content: str | None, tools: bool,
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _do_stream(messages: list[dict]) -> str:
-    """One raw streaming request → full text response."""
     data = json.dumps({"model": MODEL, "messages": messages, "stream": True}).encode()
     req  = urllib.request.Request(
-        f"{OLLAMA_URL}/chat", data=data,
+        f"{OLLAMA_URL}/chat/completions", data=data,  # Standardized v1 endpoint
         headers={"Content-Type": "application/json"}, method="POST",
     )
 
