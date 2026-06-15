@@ -684,7 +684,7 @@ def build_system_prompt(file_content: str | None, tools: bool,
 def _do_stream(messages: list[dict]) -> str:
     data = json.dumps({"model": MODEL, "messages": messages, "stream": True}).encode()
     req  = urllib.request.Request(
-        f"{OLLAMA_URL}/chat/completions", data=data,  # Standardized v1 endpoint
+        f"{OLLAMA_URL.replace('v1', 'api')}/chat", data=data,  # Standardized v1 endpoint
         headers={"Content-Type": "application/json"}, method="POST",
     )
 
