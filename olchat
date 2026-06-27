@@ -24,7 +24,7 @@ Keyboard shortcuts (interactive mode):
     - Continue editing after each file selection
 
 Tool use:
-  The model can run shell commands and write files.
+  The model can run shell commands, write files, and explore a codebase.
   Permissions are checked before every tool call:
     - ask        : prompt each time
     - session    : allow for this run only
@@ -35,6 +35,16 @@ Tool use:
 
   Examples that should stay as 'ask':
     git commit, git push, rm, write_file
+
+Codebase exploration:
+  A file listing of the current project (or --codebase DIR) is injected
+  into the system prompt automatically, and the model can use the
+  read-only grep / list_files / read_file tools (no permission prompt)
+  to dig into the code before deciding what to do. This is especially
+  useful for vague tasks run via --tasks, where the model has to figure
+  out what needs doing rather than being told explicitly.
+  Use --codebase to point at a different project, and --no-codebase-context
+  to skip the automatic overview (the tools remain available either way).
 
 Task queue:
   The model can call task_add / task_done / task_list to manage a
@@ -89,6 +99,15 @@ TASKS_DB     = Path.home() / ".ollama_chat_tasks.db"
 HISTORY_FILE = Path.home() / ".ollama_chat_history.json"
 SKILLS_DIR   = Path.home() / ".bin/.skills"
 SESSIONS_DIR = Path.home() / ".ollama_chat_sessions"
+CODEBASE_ROOT = "."     # root dir used for codebase overview + grep/list_files tools
+INCLUDE_CODEBASE_CONTEXT = True   # set False via --no-codebase-context
+
+# Directories ignored when walking/listing a codebase
+_CODEBASE_IGNORE_DIRS = {
+    ".git", "node_modules", "__pycache__", ".venv", "venv", "env",
+    "dist", "build", ".idea", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    "target", ".next", ".cache", "vendor",
+}
 
 # Session saving state
 _session_file: Path | None = None
@@ -436,16 +455,25 @@ Available tools:
 3. read_file — read a file (no permission needed)
    { "tool": "read_file", "path": "foo.py" }
 
-4. task_add — add a sub-task to the queue
+4. grep — search file contents for a pattern (no permission needed, read-only)
+   { "tool": "grep", "pattern": "def handle_", "path": ".", "glob": "*.py" }
+   "path" defaults to the codebase root. "glob" is optional and filters
+   which files are searched (e.g. "*.py", "*.ts"). Uses ripgrep if available.
+
+5. list_files — list files under a path, optionally matching a glob
+   (no permission needed, read-only)
+   { "tool": "list_files", "path": ".", "pattern": "**/*.py" }
+
+6. task_add — add a sub-task to the queue
    { "tool": "task_add", "title": "Run tests", "detail": "pytest -x" }
 
-5. task_done — mark a task complete
+7. task_done — mark a task complete
    { "tool": "task_done", "id": 3, "result": "all tests passed" }
 
-6. task_list — list all tasks
+8. task_list — list all tasks
    { "tool": "task_list" }
 
-7. load_skill — load a skill by name into context (model uses this for auto-detection)
+9. load_skill — load a skill by name into context (model uses this for auto-detection)
    { "tool": "load_skill", "name": "git" }
 
 Rules:
@@ -453,6 +481,11 @@ Rules:
 - One tool call per fenced block.
 - If a tool is denied, work around it or explain why you cannot proceed.
 - After completing all tool calls needed for a task, summarise what was done.
+- You are given a codebase overview (a file listing) automatically below.
+  Before deciding what action to take — especially for a vague or
+  open-ended task — use grep/list_files/read_file to explore the codebase
+  and confirm what actually needs to change, rather than guessing from the
+  task title alone.
 """
 
 
@@ -523,6 +556,62 @@ def run_tool(call: dict) -> str:
             return content
         except Exception as e:
             return f"[error reading {path}: {e}]"
+
+    # ── grep ───────────────────────────────────────────────────────────────
+    elif tool == "grep":
+        pattern = call.get("pattern", "").strip()
+        path    = call.get("path", "").strip() or CODEBASE_ROOT
+        file_glob = call.get("glob", "").strip()
+        if not pattern:
+            return "[error: grep called with no pattern]"
+
+        if shutil.which("rg"):
+            cmd = ["rg", "-n", "--no-heading", "--color", "never", "-m", "200"]
+            for d in _CODEBASE_IGNORE_DIRS:
+                cmd += ["-g", f"!{d}"]
+            if file_glob:
+                cmd += ["-g", file_glob]
+            cmd += [pattern, path]
+        else:
+            cmd = ["grep", "-rn", "-I"]
+            for d in _CODEBASE_IGNORE_DIRS:
+                cmd += [f"--exclude-dir={d}"]
+            if file_glob:
+                cmd += [f"--include={file_glob}"]
+            cmd += [pattern, path]
+
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            output = proc.stdout.strip() or proc.stderr.strip() or "(no matches)"
+            if len(output) > 6000:
+                output = output[:6000] + "\n... [truncated]"
+            return output
+        except subprocess.TimeoutExpired:
+            return "[error: grep timed out after 30s]"
+        except Exception as e:
+            return f"[error running grep: {e}]"
+
+    # ── list_files ─────────────────────────────────────────────────────────
+    elif tool == "list_files":
+        path    = call.get("path", "").strip() or CODEBASE_ROOT
+        pattern = call.get("pattern", "").strip() or "**/*"
+        try:
+            base = Path(path)
+            if not base.exists():
+                return f"[error: {path} not found]"
+            results = []
+            for p in sorted(base.glob(pattern)):
+                rel = p.relative_to(base) if p.is_absolute() or base.is_absolute() else p
+                if any(part in _CODEBASE_IGNORE_DIRS for part in p.parts):
+                    continue
+                if p.is_file():
+                    results.append(str(p))
+                if len(results) >= 500:
+                    results.append("... [truncated, narrow your pattern]")
+                    break
+            return "\n".join(results) if results else "(no files matched)"
+        except Exception as e:
+            return f"[error listing files: {e}]"
 
     # ── task_add ───────────────────────────────────────────────────────────
     elif tool == "task_add":
@@ -662,6 +751,67 @@ def expand_at_refs(raw: str) -> tuple[str, list[Path]]:
 # File helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def build_codebase_tree(root: str = ".", max_files: int = 400) -> str:
+    """
+    Build a compact file listing for `root`, so the model can see project
+    structure without needing to ask or grep around blindly.
+
+    Prefers `git ls-files` (respects .gitignore automatically) when `root`
+    is a git repo; falls back to a manual walk that skips common noisy
+    directories (node_modules, .venv, __pycache__, etc).
+    """
+    root_path = Path(root).expanduser().resolve()
+    if not root_path.is_dir():
+        return f"(codebase root {root_path} is not a directory)"
+
+    files: list[str] = []
+
+    if shutil.which("git") and (root_path / ".git").exists():
+        try:
+            proc = subprocess.run(
+                ["git", "ls-files"], cwd=root_path,
+                capture_output=True, text=True, timeout=10,
+            )
+            if proc.returncode == 0:
+                files = [f for f in proc.stdout.splitlines() if f.strip()]
+        except Exception:
+            files = []
+
+    if not files:
+        for p in sorted(root_path.rglob("*")):
+            rel = p.relative_to(root_path)
+            if any(part in _CODEBASE_IGNORE_DIRS for part in rel.parts):
+                continue
+            if p.is_file():
+                files.append(str(rel))
+
+    if not files:
+        return "(no files found)"
+
+    total = len(files)
+    shown = files[:max_files]
+    out = "\n".join(shown)
+    if total > max_files:
+        out += f"\n... [{total - max_files} more files not shown — use list_files/grep to dig further]"
+    return out
+
+
+def codebase_overview_block(root: str = ".") -> str:
+    """Format the codebase tree as a system-prompt block."""
+    tree = build_codebase_tree(root)
+    root_path = Path(root).expanduser().resolve()
+    return (
+        f"--- CODEBASE OVERVIEW: {root_path} ---\n"
+        f"{tree}\n"
+        "--- END CODEBASE OVERVIEW ---\n"
+        "This is a file listing of the current project, given automatically so you "
+        "don't need to ask what's in the directory. Use the `read_file`, `grep`, and "
+        "`list_files` tools to explore further before deciding what to do — especially "
+        "for vague or open-ended tasks where you need to figure out the right action "
+        "yourself rather than guessing."
+    )
+
+
 def read_file_safe(path: str) -> str:
     p = Path(path)
     if not p.exists():
@@ -687,7 +837,10 @@ def build_user_message(text: str, inline_paths: list[Path]) -> str:
 
 
 def build_system_prompt(file_content: str | None, tools: bool,
-                        active_skills: list[dict] | None = None) -> str:
+                        active_skills: list[dict] | None = None,
+                        include_codebase: bool | None = None) -> str:
+    if include_codebase is None:
+        include_codebase = INCLUDE_CODEBASE_CONTEXT
     parts = []
     if tools:
         all_skills = load_all_skills()
@@ -696,6 +849,11 @@ def build_system_prompt(file_content: str | None, tools: bool,
         if index:
             tool_prompt += "\n\n" + index
         parts.append(tool_prompt)
+    # Auto-inject a codebase overview so the model knows project structure
+    # up front, without needing to ask or guess. Only meaningful when tools
+    # (read_file/grep/list_files) are available to dig further.
+    if tools and include_codebase:
+        parts.append(codebase_overview_block(CODEBASE_ROOT))
     # Inject any already-active skills (loaded via @skill: or auto-detect)
     if active_skills:
         for skill in active_skills:
@@ -1038,7 +1196,13 @@ def handle_slash(cmd: str) -> bool:
     @<filename>         — attach file(s) via fzf (doesn't submit, allows more input)
     @@                  — literal @
     @skill:name         — inject a skill into the conversation
-    
+
+  Codebase exploration (model-driven, no permission prompt):
+    The model is shown a file listing of the codebase automatically and
+    can use the read_file, grep, and list_files tools to explore it
+    before deciding what to do. Use --codebase DIR to point this at a
+    different project, or --no-codebase-context to disable the overview.
+
   Examples:
     You: summarise @          (opens fzf, then continues accepting input)
     You: compare @ vs @       (pick two files, continue editing)
@@ -1455,7 +1619,9 @@ def interactive(file_content: str | None, output_path: str | None, tools: bool) 
     print("Tips: use @ to attach files (fzf opens inline), Ctrl+E to edit in $EDITOR")
     print("      type /help for commands")
     if tools:
-        print("Tools: shell, write_file, read_file, task_add/done/list are available")
+        print("Tools: shell, write_file, read_file, grep, list_files, task_add/done/list are available")
+    if tools and INCLUDE_CODEBASE_CONTEXT:
+        print(f"[codebase overview: {Path(CODEBASE_ROOT).resolve()} — use --codebase to point elsewhere]")
     if not _fzf_available():
         print("       (install fzf for fuzzy file picking)")
     if file_content:
@@ -1669,7 +1835,7 @@ def resume_session(directory: str, file_content: str | None, output_path: str | 
     print("Tips: use @ to attach files (fzf opens inline), Ctrl+E to edit in $EDITOR")
     print("      type /help for commands")
     if tools:
-        print("Tools: shell, write_file, read_file, task_add/done/list are available")
+        print("Tools: shell, write_file, read_file, grep, list_files, task_add/done/list are available")
     if file_content:
         print("[File loaded via -f — model has access to its contents]")
     if output_path:
@@ -1765,7 +1931,7 @@ def resume_session(directory: str, file_content: str | None, output_path: str | 
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
-    global MODEL, OLLAMA_URL, _history
+    global MODEL, OLLAMA_URL, _history, CODEBASE_ROOT, INCLUDE_CODEBASE_CONTEXT
 
     _history = _load_history()
     atexit.register(lambda: _save_history(_history))
@@ -1797,12 +1963,20 @@ def main() -> None:
                         help="Show current permissions and exit")
     parser.add_argument("--resume",         nargs='?', const='.', metavar="DIR",
                         help="Resume a session from the latest transcript (default: current dir)")
+    parser.add_argument("--codebase",       metavar="DIR", default=".",
+                        help="Root directory for the auto codebase overview and "
+                             "grep/list_files tools (default: current dir)")
+    parser.add_argument("--no-codebase-context", action="store_true",
+                        help="Don't auto-inject a codebase file listing into the "
+                             "system prompt (grep/list_files tools remain available)")
 
     args = parser.parse_args()
 
     MODEL      = args.model
     OLLAMA_URL = args.base_url.rstrip("/")
     tools      = not args.no_tools
+    CODEBASE_ROOT = args.codebase
+    INCLUDE_CODEBASE_CONTEXT = not args.no_codebase_context
 
     # ── quick sub-commands ────────────────────────────────────────────────
     if args.perms:

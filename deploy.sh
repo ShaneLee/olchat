@@ -2,4 +2,4 @@
 
 set -e
 
-cp olchat /usr/local/bin/
+sudo cp olchat /usr/local/bin/
