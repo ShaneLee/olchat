@@ -101,6 +101,7 @@ SKILLS_DIR   = Path.home() / ".bin/.skills"
 SESSIONS_DIR = Path.home() / ".ollama_chat_sessions"
 CODEBASE_ROOT = "."     # root dir used for codebase overview + grep/list_files tools
 INCLUDE_CODEBASE_CONTEXT = True   # set False via --no-codebase-context
+NUM_CTX: int | None = None        # set via --ctx; forwarded to Ollama as options.num_ctx
 
 # Directories ignored when walking/listing a codebase
 _CODEBASE_IGNORE_DIRS = {
@@ -751,7 +752,7 @@ def expand_at_refs(raw: str) -> tuple[str, list[Path]]:
 # File helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def build_codebase_tree(root: str = ".", max_files: int = 400) -> str:
+def build_codebase_tree(root: str = ".", max_files: int = 150, max_chars: int = 3500) -> str:
     """
     Build a compact file listing for `root`, so the model can see project
     structure without needing to ask or grep around blindly.
@@ -759,6 +760,10 @@ def build_codebase_tree(root: str = ".", max_files: int = 400) -> str:
     Prefers `git ls-files` (respects .gitignore automatically) when `root`
     is a git repo; falls back to a manual walk that skips common noisy
     directories (node_modules, .venv, __pycache__, etc).
+
+    Bounded by both file count and total character budget — a repo with a
+    few hundred deeply-nested files can blow a small model's context window
+    even with a sane file-count cap, since path length adds up fast.
     """
     root_path = Path(root).expanduser().resolve()
     if not root_path.is_dir():
@@ -784,15 +789,30 @@ def build_codebase_tree(root: str = ".", max_files: int = 400) -> str:
                 continue
             if p.is_file():
                 files.append(str(rel))
+            if len(files) >= max_files * 4:
+                # Stop walking early on huge trees — we only need enough
+                # candidates to fill max_files anyway.
+                break
 
     if not files:
         return "(no files found)"
 
     total = len(files)
-    shown = files[:max_files]
-    out = "\n".join(shown)
-    if total > max_files:
-        out += f"\n... [{total - max_files} more files not shown — use list_files/grep to dig further]"
+    shown_lines: list[str] = []
+    char_count = 0
+    truncated_for_chars = False
+    for f in files[:max_files]:
+        if char_count + len(f) + 1 > max_chars:
+            truncated_for_chars = True
+            break
+        shown_lines.append(f)
+        char_count += len(f) + 1
+
+    out = "\n".join(shown_lines)
+    remaining = total - len(shown_lines)
+    if remaining > 0:
+        reason = "character budget reached" if truncated_for_chars else "file-count cap reached"
+        out += f"\n... [{remaining} more files not shown ({reason}) — use list_files/grep to dig further]"
     return out
 
 
@@ -873,13 +893,18 @@ def build_system_prompt(file_content: str | None, tools: bool,
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _do_stream(messages: list[dict]) -> str:
-    data = json.dumps({"model": MODEL, "messages": messages, "stream": True}).encode()
+    payload = {"model": MODEL, "messages": messages, "stream": True}
+    if NUM_CTX:
+        payload["options"] = {"num_ctx": NUM_CTX}
+    data = json.dumps(payload).encode()
     req  = urllib.request.Request(
         f"{OLLAMA_URL.replace('v1', 'api')}/chat", data=data,  # Standardized v1 endpoint
         headers={"Content-Type": "application/json"}, method="POST",
     )
 
     full: list[str] = []
+    error_msg: str | None = None
+    done_reason: str | None = None
     spinner = Spinner()
     spinner.start()
     first = True
@@ -894,6 +919,9 @@ def _do_stream(messages: list[dict]) -> str:
                     chunk = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if "error" in chunk:
+                    error_msg = str(chunk["error"])
+                    break
                 token = chunk.get("message", {}).get("content", "")
                 if token:
                     if first:
@@ -902,7 +930,18 @@ def _do_stream(messages: list[dict]) -> str:
                     print(token, end="", flush=True)
                     full.append(token)
                 if chunk.get("done"):
+                    done_reason = chunk.get("done_reason")
                     break
+    except urllib.error.HTTPError as e:
+        spinner.stop()
+        try:
+            body = e.read().decode(errors="replace")
+        except Exception:
+            body = ""
+        sys.exit(
+            f"Error: Ollama returned HTTP {e.code} for model '{MODEL}'\n"
+            f"  {body or e.reason}"
+        )
     except urllib.error.URLError as e:
         spinner.stop()
         sys.exit(
@@ -914,7 +953,30 @@ def _do_stream(messages: list[dict]) -> str:
             spinner.stop()
 
     print()
-    return "".join(full)
+
+    if error_msg:
+        return f"[ollama error: {error_msg}]"
+
+    result = "".join(full)
+
+    if not result.strip():
+        hint = (
+            f"[no response — Ollama returned no content for model '{MODEL}'"
+            + (f" (done_reason: {done_reason})" if done_reason else "")
+            + ".\n"
+            "  This usually means the request — including the system prompt and "
+            "any auto-injected codebase overview — exceeded the model's context "
+            "window. Try: --no-codebase-context, a narrower --codebase root, "
+            "or raise the window with --ctx 8192 (or higher).\n"
+            "  Also worth checking `ollama ps` and the `ollama serve` logs for "
+            "a more specific error.]"
+        )
+        return hint
+
+    if done_reason and done_reason not in ("stop", "load"):
+        result += f"\n\n[note: generation ended early — done_reason: {done_reason}]"
+
+    return result
 
 
 def stream_chat(messages: list[dict]) -> str:
@@ -1931,7 +1993,7 @@ def resume_session(directory: str, file_content: str | None, output_path: str | 
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
-    global MODEL, OLLAMA_URL, _history, CODEBASE_ROOT, INCLUDE_CODEBASE_CONTEXT
+    global MODEL, OLLAMA_URL, _history, CODEBASE_ROOT, INCLUDE_CODEBASE_CONTEXT, NUM_CTX
 
     _history = _load_history()
     atexit.register(lambda: _save_history(_history))
@@ -1969,6 +2031,10 @@ def main() -> None:
     parser.add_argument("--no-codebase-context", action="store_true",
                         help="Don't auto-inject a codebase file listing into the "
                              "system prompt (grep/list_files tools remain available)")
+    parser.add_argument("--ctx",            metavar="N", type=int, default=None,
+                        help="Set Ollama's context window (options.num_ctx) for this "
+                             "run, e.g. --ctx 8192. Raise this if responses come back "
+                             "empty or truncated, especially with codebase context on.")
 
     args = parser.parse_args()
 
@@ -1977,6 +2043,7 @@ def main() -> None:
     tools      = not args.no_tools
     CODEBASE_ROOT = args.codebase
     INCLUDE_CODEBASE_CONTEXT = not args.no_codebase_context
+    NUM_CTX = args.ctx
 
     # ── quick sub-commands ────────────────────────────────────────────────
     if args.perms:
