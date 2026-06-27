@@ -13,6 +13,8 @@ Keyboard shortcuts (interactive mode):
   ^E     : Open current prompt in $EDITOR (useful for multi-line messages)
   ^U     : Clear the current line
   ^C     : Cancel and start a new prompt
+  ^P/^N  : Navigate prompt history (or Up/Down arrow)
+  ^K/^J  : Navigate prompt history (vim keys)
 
 @ references (interactive mode):
   Type @ to open fzf and pick files. Each Enter selection adds the file
@@ -54,6 +56,7 @@ import tempfile
 import termios
 import threading
 import time
+import atexit
 import tty
 import urllib.request
 import urllib.error
@@ -75,16 +78,26 @@ class Colors:
     def wrap(text: str, color: str) -> str:
         return f"{color}{text}{Colors.RESET}"
 
+def _display_width(s: str) -> int:
+    """Calculate the display width of a string, ignoring ANSI escape codes."""
+    return len(re.sub(r'\x1b\[[0-9;]*[mGK]', '', s))
+
 MODEL        = "gemma4:12b"
 OLLAMA_URL   = "http://localhost:11434/v1"
 PERMS_FILE   = Path.home() / ".ollama_chat_perms.json"
 TASKS_DB     = Path.home() / ".ollama_chat_tasks.db"
+HISTORY_FILE = Path.home() / ".ollama_chat_history.json"
 SKILLS_DIR   = Path.home() / ".bin/.skills"
 SESSIONS_DIR = Path.home() / ".ollama_chat_sessions"
 
 # Session saving state
 _session_file: Path | None = None
 _session_lock = threading.Lock()
+
+# Prompt history
+_history: list[str] = []
+_history_index: int = -1 # -1 means new input, 0 is the first history item
+_current_input_buffer: str = "" # Stores the current line when navigating history
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -160,6 +173,26 @@ def _load_global_perms() -> dict[str, str]:
 
 def _save_global_perms(perms: dict[str, str]) -> None:
     PERMS_FILE.write_text(json.dumps(perms, indent=2))
+
+
+def _load_history() -> list[str]:
+    if HISTORY_FILE.exists():
+        try:
+            content = HISTORY_FILE.read_text()
+            history = json.loads(content)
+            if isinstance(history, list):
+                return history
+        except Exception:
+            # If file is corrupted or not JSON, start with empty history
+            pass
+    return []
+
+def _save_history(history: list[str]) -> None:
+    try:
+        HISTORY_FILE.write_text(json.dumps(history))
+    except Exception:
+        # Silently fail if history cannot be saved
+        pass
 
 
 def _perm_key_for_shell(cmd: str) -> str:
@@ -877,7 +910,14 @@ def skills_index_prompt(skills: list[dict]) -> str:
     """
     if not skills:
         return ""
-    lines = ["## Available skills (use `load_skill` tool to activate one)"]
+    lines = [
+        "## Available skills",
+        "To activate a skill, use the `load_skill` tool:",
+        "~~~tool",
+        "{ \"tool\": \"load_skill\", \"name\": \"<skill_name>\" }",
+        "~~~",
+        "Here are the available skills:"
+    ]
     for s in skills:
         trigger_hint = f"  triggers: {', '.join(s['triggers'])}" if s["triggers"] else ""
         lines.append(f"- **{s['name']}**: {s['description']}{trigger_hint}")
@@ -1137,7 +1177,8 @@ def prompt_line_with_at_support(prompt_text: str = "You: ") -> str:
     try:
         while True:
             try:
-                user_line = _read_line_with_editor_support()
+                # Pass the displayed prompt text to the low-level reader
+                user_line = _read_line_with_editor_support(Colors.wrap(prompt_text, Colors.CYAN))
             except EOFError:
                 if full_input:
                     return full_input
@@ -1221,21 +1262,41 @@ def prompt_line_with_at_support(prompt_text: str = "You: ") -> str:
     except EOFError:
         return full_input if full_input else ""
 
-def _read_line_with_editor_support(prompt_text: str = "") -> str:
+def _read_line_with_editor_support(displayed_prompt_text: str = "") -> str:
     """
-    Read a line from user with support for ^E to open in editor.
+    Read a line from user with support for ^E to open in editor and history navigation.
     When ^E is pressed, current input is opened in $EDITOR.
+    Arrow Up/Down and Ctrl+J/K navigate history.
     """
+    global _history, _history_index, _current_input_buffer
+
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
-    
+
     try:
         tty.setraw(fd)
         line = ""
-        
+        _history_index = len(_history) # Start at the end of history for new input
+
+        last_displayed_length = 0 # Track the length of the last line drawn
+        prompt_display_width = _display_width(displayed_prompt_text)
+
+        def redraw_line(current_line: str):
+            nonlocal last_displayed_length
+            # Clear current line by overwriting with spaces up to the last displayed length
+            # Need to account for the prompt_text length as well
+            clear_length = prompt_display_width + last_displayed_length
+            sys.stdout.write('\r' + ' ' * clear_length + '\r')
+            sys.stdout.write(displayed_prompt_text + current_line)
+            sys.stdout.flush()
+            last_displayed_length = len(current_line)
+
+        redraw_line(line) # Initial draw of the prompt
+
+
         while True:
             ch = sys.stdin.read(1)
-            
+
             if not ch:
                 # EOF
                 raise EOFError()
@@ -1244,48 +1305,109 @@ def _read_line_with_editor_support(prompt_text: str = "") -> str:
             elif ch == '\x03':
                 termios.tcsetattr(fd, termios.TCSADRAIN, saved)
                 raise KeyboardInterrupt()
-            
+
+            # Escape sequences (for arrow keys)
+            elif ch == '\x1b':
+                # Read next two characters to determine escape sequence
+                # This is a simplified approach; a robust solution might use select.select
+                seq = ""
+                try:
+                    seq += sys.stdin.read(1)
+                    seq += sys.stdin.read(1)
+                except BlockingIOError:
+                    pass # Incomplete sequence, treat as literal escape or ignore
+
+                if seq == '[A':  # Arrow Up
+                    if _history_index == len(_history): # If currently typing new input
+                        _current_input_buffer = line # Save current input
+                    
+                    if _history_index > 0:
+                        _history_index -= 1
+                        line = _history[_history_index]
+                        redraw_line(line)
+                    else:
+                        # Already at the oldest history item
+                        pass
+                    continue
+                elif seq == '[B': # Arrow Down
+                    if _history_index < len(_history):
+                        _history_index += 1
+                        if _history_index == len(_history): # Back to new input
+                            line = _current_input_buffer
+                        else:
+                            line = _history[_history_index]
+                        redraw_line(line)
+                    else:
+                        # Already at the newest history item (or new input)
+                        pass
+                    continue
+                else:
+                    # Not an arrow key, treat as literal escape or ignore
+                    pass
+
             # Ctrl+E: open in editor
-            if ch == '\x05':  # ASCII 5 = Ctrl+E
-                print()  # newline
+            elif ch == '\x05':  # ASCII 5 = Ctrl+E
+                sys.stdout.write('\n') # Move to a new line before opening editor
                 edited = _open_in_editor(line)
                 if edited is not None:
                     termios.tcsetattr(fd, termios.TCSADRAIN, saved)
                     return edited.rstrip('\n')
                 else:
-                    # Editor cancelled or failed, show current input and continue
-                    sys.stdout.write(line)
-                    sys.stdout.flush()
+                    # Editor cancelled or failed, redraw current input and continue
+                    redraw_line(line)
                     continue
-            
-            
+
+            # Ctrl+K (vim up) or Ctrl+P
+            elif ch == '\x0b' or ch == '\x10':
+                if _history_index == len(_history):
+                    _current_input_buffer = line
+                if _history_index > 0:
+                    _history_index -= 1
+                    line = _history[_history_index]
+                    redraw_line(line)
+                continue
+
+            # Ctrl+J (vim down) or Ctrl+N
+            elif ch == '\x0a' or ch == '\x0e':
+                if _history_index < len(_history):
+                    _history_index += 1
+                    if _history_index == len(_history):
+                        line = _current_input_buffer
+                    else:
+                        line = _history[_history_index]
+                    redraw_line(line)
+                continue
+
             # Ctrl+U: clear line
             elif ch == '\x15':
                 line = ""
-                sys.stdout.write('\r' + ' ' * 100 + '\r')
-                sys.stdout.flush()
+                redraw_line(line)
                 continue
-            
+
             # Backspace / Ctrl+H
             elif ch in ('\x7f', '\x08'):
                 if line:
                     line = line[:-1]
-                    sys.stdout.write('\b \b')
-                    sys.stdout.flush()
+                    redraw_line(line)
                 continue
-            
-            # Enter / Ctrl+J (raw terminal sends \r, not \n)
-            elif ch in ('\r', '\n'):
-                sys.stdout.write('\n')
+
+            # Enter (raw terminal sends \r, not \n)
+            elif ch == '\r':
+                sys.stdout.write('\n') # Newline for the next prompt
                 sys.stdout.flush()
                 termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+                
+                # Add to history if not empty and not a duplicate of the last entry
+                if line and (not _history or _history[-1] != line):
+                    _history.append(line)
+                _history_index = len(_history) # Reset index for new input
+                _current_input_buffer = "" # Clear buffer
                 return line
-            
+
             # Printable character
             elif ord(ch) >= 32 and ord(ch) < 127:
                 line += ch
-                sys.stdout.write(ch)
-                sys.stdout.flush()
+                redraw_line(line)
             
             # Other control characters: ignore
     
@@ -1643,7 +1765,10 @@ def resume_session(directory: str, file_content: str | None, output_path: str | 
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
-    global MODEL, OLLAMA_URL
+    global MODEL, OLLAMA_URL, _history
+
+    _history = _load_history()
+    atexit.register(lambda: _save_history(_history))
 
     parser = argparse.ArgumentParser(
         description=f"Chat with {MODEL} via Ollama.",
